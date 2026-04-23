@@ -3,46 +3,45 @@ package concurrent_aggregator
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"time"
-
 	"github.com/medunes/go-kata/01-context-cancellation-concurrency/01-concurrent-aggregator/order"
 	"github.com/medunes/go-kata/01-context-cancellation-concurrency/01-concurrent-aggregator/profile"
-
 	"golang.org/x/sync/errgroup"
+	"log/slog"
+	"time"
 )
 
-type Option func(ua *UserAggregator)
-
-func WithLogger(l *slog.Logger) Option {
-	return func(ua *UserAggregator) {
-		ua.logger = l
-	}
-}
-
-func WithTimeout(timeout time.Duration) Option {
-	return func(ua *UserAggregator) {
-		ua.timeout = timeout
-	}
-}
-
 type UserAggregator struct {
-	orderService   order.Service
+	// По значению, так как реализация по значению
 	profileService profile.Service
-	timeout        time.Duration
-	logger         *slog.Logger
+	orderService   order.Service
+	logger         slog.Logger   // Обычно по значению и заполнение default значением в случае если не передано. Иначе везде придется проверять на nil.
+	timeout        time.Duration // По значению и проверка на 0
 }
 
-func NewUserAggregator(os order.Service, ps profile.Service, opts ...Option) *UserAggregator {
-	ua := &UserAggregator{
-		orderService:   os,
-		profileService: ps,
-		logger:         slog.Default(), // avoid nil panics, default writes to stderr
+func NewUserAggregator(orderService order.Service, profileService profile.Service, options ...OptFunc) *UserAggregator {
+	agg := &UserAggregator{
+		orderService:   orderService,
+		profileService: profileService,
+		logger:         *slog.Default(),
 	}
-	for _, opt := range opts {
-		opt(ua)
+	for _, opt := range options {
+		opt(agg)
 	}
-	return ua
+	return agg
+}
+
+type OptFunc func(agg *UserAggregator)
+
+func WithTimeout(timeout time.Duration) OptFunc {
+	return func(agg *UserAggregator) {
+		agg.timeout = timeout
+	}
+}
+
+func WithLogger(logger *slog.Logger) OptFunc {
+	return func(agg *UserAggregator) {
+		agg.logger = *logger
+	}
 }
 
 type AggregatedProfile struct {
@@ -50,53 +49,52 @@ type AggregatedProfile struct {
 	Cost float64
 }
 
-func (ua *UserAggregator) Aggregate(ctx context.Context, id int) ([]*AggregatedProfile, error) {
-	var (
-		localCtx context.Context
-		cancel   context.CancelFunc
-		pr       *profile.Profile
-		or       []*order.Order
-		au       []*AggregatedProfile
-		g        *errgroup.Group
-	)
-	if ua.timeout > 0 {
-		localCtx, cancel = context.WithTimeout(ctx, ua.timeout)
-	} else {
-		localCtx, cancel = context.WithCancel(ctx)
+func (ua *UserAggregator) Aggregate(ctx context.Context, userId int) ([]*AggregatedProfile, error) {
+	g, ctx := errgroup.WithContext(ctx)
+
+	var pr *profile.Profile
+	var orders []*order.Order
+	var cancel context.CancelFunc
+
+	if ua.timeout != 0 {
+		ctx, cancel = context.WithTimeout(ctx, ua.timeout)
+		defer cancel()
 	}
-	defer cancel()
-	ua.logger.Info("starting aggregation", "user_id", id)
-	g, localCtx = errgroup.WithContext(localCtx)
+
+	ua.logger.Info("starting aggregation", "user_id", userId)
 	g.Go(func() error {
 		var err error
-		pr, err = ua.profileService.Get(localCtx, id)
+		pr, err = ua.profileService.Get(ctx, userId)
 		if err != nil {
-			ua.logger.Warn("failed to fetch profile", "user_id", id, "err", err)
-			return fmt.Errorf("profile fetch failed: %w", err)
+			ua.logger.Warn("failed fetch profile", "user_id", userId, "err", err)
+			return fmt.Errorf("pr get: %w", err)
 		}
 		return nil
 	})
+
 	g.Go(func() error {
 		var err error
-		or, err = ua.orderService.GetAll(localCtx, id)
+		orders, err = ua.orderService.GetAll(ctx, userId)
 		if err != nil {
-			ua.logger.Warn("failed to fetch order", "user_id", id, "err", err)
-			return fmt.Errorf("order fetch failed: %w", err)
+			ua.logger.Warn("failed fetch orders", "user_id", userId, "err", err)
+			return fmt.Errorf("orders get all: %w", err)
 		}
-		return nil
 
+		return nil
 	})
 
-	err := g.Wait()
-	if err != nil {
-		ua.logger.Warn("aggregator exited with error", "user_id", id, "err", err)
+	if err := g.Wait(); err != nil {
+		ua.logger.Warn("aggregator exited with error", "user_id", userId, "err", err)
 		return nil, err
 	}
-	for _, o := range or {
-		if o.UserId == id {
-			au = append(au, &AggregatedProfile{pr.Name, o.Cost})
+
+	var res []*AggregatedProfile
+	for _, o := range orders {
+		if o.UserId == userId {
+			res = append(res, &AggregatedProfile{Name: pr.Name, Cost: o.Cost})
 		}
 	}
-	ua.logger.Info("aggregation complete successfully", "user_id", id, "count", len(au))
-	return au, nil
+	ua.logger.Info("aggregation complete successfully", "user_id", userId, "count", len(res))
+
+	return res, nil
 }
